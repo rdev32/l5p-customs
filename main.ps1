@@ -1,16 +1,21 @@
-if (![bool](([System.Security.Principal.WindowsIdentity]::GetCurrent()).groups -match 'S-1-5-32-544')) {
-  Write-Host "Debes ejecutar este archivo como administrador"
-  exit 0
-}
-
 if (!($PSVersionTable.PSEdition -eq 'Core')) {
   Write-Host "Debes ejecutar este archivo con Powershell 7 o versiones posteriores"
   exit 0
 }
 
-$beforeTitle = $Host.UI.RawUI.WindowTitle
 function Disable-WindowsDefender {
+  [CmdletBinding()]
   param()
+
+  if (!(Test-SafeMode)) {
+    Write-Host "Para usar esto, debes iniciar el computador en modo seguro."
+    return
+  }
+
+  if (![bool](([System.Security.Principal.WindowsIdentity]::GetCurrent()).groups -match "S-1-5-32-544")) {
+    Write-Host "Esta funcionalidad debe ejecutarse como administrador"
+    return
+  }
 
   $registryPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
   $keys = @(
@@ -98,87 +103,133 @@ function Disable-WindowsDefender {
 }
 
 function Wait-KeyPress {
+  [CmdletBinding()]
+  param()
   Write-Host "Presione cualquier tecla para continuar.."
   $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
 
 function Disable-DriverUpdates {
+  [CmdletBinding()]
   param()
+
+  if (![bool](([System.Security.Principal.WindowsIdentity]::GetCurrent()).groups -match "S-1-5-32-544")) {
+    Write-Host "Esta funcionalidad debe ejecutarse como administrador"
+    return
+  }
 
   $registryPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching"
 
   if (!(Test-Path $registryPath)) {
     Write-Host "No se encontró la opción para desactivar las actualizaciones de controladores."
-    return -1
+    return
   }
 
-  Set-ItemProperty -Path $registryPath -Name 'SearchOrderConfig' -Value 0 | Out-Null
+  if ((Get-ItemProperty -Path $registryPath).SearchOrderConfig -eq 0) {
+    Write-Host "Ya se encuentra desactivada la actualizacion de controladores automatica."
+    return
+  }
+
+  Set-ItemProperty -Path $registryPath -Name "SearchOrderConfig" -Value 0 | Out-Null
   Write-Host "Actualización de controladores desactivada."
 }
 
 function Set-ComputerModelName {
+  [CmdletBinding()]
   param()
 
-  $model = (Get-ItemProperty -Path 'HKLM:\SYSTEM\HardwareConfig\Current' -Name 'SystemFamily').SystemFamily
+  if (![bool](([System.Security.Principal.WindowsIdentity]::GetCurrent()).groups -match "S-1-5-32-544")) {
+    Write-Host "Esta funcionalidad debe ejecutarse como administrador"
+    return
+  }
+
+  $model = (Get-ItemProperty -Path "HKLM:\SYSTEM\HardwareConfig\Current" -Name "SystemFamily").SystemFamily
 
   if (!$model) {
     Write-Host "No se pudo encontrar el modelo ¿Esta computadora es una laptop?"
-    return -1
+    return
   }
 
-  $modelPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation\'
+  $modelPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OEMInformation\"
 
   if (Test-Path $modelPath) {
-    Set-ItemProperty -Path $modelPath -Name 'Model' -Value $model | Out-Null
+    Set-ItemProperty -Path $modelPath -Name "Model" -Value $model | Out-Null
   }
   else {
-    New-ItemProperty -Path $modelPath -Name 'Model' -Value $model | Out-Null
+    New-ItemProperty -Path $modelPath -Name "Model" -Value $model | Out-Null
   }
 
   Write-Host "Se introdujo el nombre del modelo correctamente"
 }
 
 function Test-SafeMode {
+  [CmdletBinding()]
   param()
 
-  $bootmode = Get-CimInstance -ClassName win32_computersystem | Select-Object -ExpandProperty BootupState
-
-  if ($bootmode -eq 'Normal boot') {
-    return -1
-  }
-
-  return 0
+  return ((Get-CimInstance -ClassName win32_computersystem).BootupState -ne "Normal boot") ? $true : $false
 }
 
-function Invoke-ProcessInstallation {
+function Test-InternetConnection {
+  [CmdletBinding()]
+  param()
+
+  return (Test-Connection -ComputerName 8.8.8.8 -Count 1 -ErrorAction Stop) ? $true : $false
+}
+
+function Open-FSWindow {
+  [CmdletBinding()]
   param(
-    [string]$command
+    [string]$Path
   )
 
-  $process = Start-Process -FilePath "pwsh.exe" -ArgumentList "-Command `"$command`"" -PassThru -Wait -WindowStyle Hidden
-  return $process.ExitCode
+  if (!(Test-Path $Path)) {
+    Write-Host "No se encontro el folder de controladores, por favor coloquelo en C:\Drivers"
+    return
+  }
+
+  Write-Host "Se abrio el folder de controladores."
+  Invoke-Item -Path $Path
 }
+
+function Invoke-PackageInstall {
+  [CmdletBinding()]
+  param(
+    [string]$PackageName
+  )
+
+  Start-Process -FilePath "pwsh.exe" -ArgumentList "-Command `"winget install --id $($PackageName) -e`"" -PassThru -Wait -WindowStyle Hidden | Out-Null
+}
+
+function Test-IsPackageInstalled {
+  param (
+    [string]$PackageName
+  )
+
+  $exitCode = (Start-Process -FilePath "pwsh.exe" -ArgumentList "-Command `"winget list --id $($PackageName) -e`"" -PassThru -Wait -WindowStyle Hidden).ExitCode
+  return ($exitCode -eq 0) ? $true : $false
+}
+
 
 function Install-SoftwarePackage {
   param(
     [string[]]$Packages
   )
 
-  $currentProgress = 0
-  foreach ($name in $Packages) {
-    $currentProgress++
-    $progressStatus = "($($currentProgress) / $($Packages.Count)) $($name)"
-
-    if (!(Invoke-ProcessInstallation -command "winget list --id $($name) -e" -eq 0)) {
-      Write-Host "El programa $($name) ya esta instalado`t"
-      continue
-    }
-
-    Write-Host "Instalando $($progressStatus)"
-    Invoke-ProcessInstallation -command "winget install --id $($name) -e"
+  if (!(Test-InternetConnection)) {
+    Write-Host "No tienes conexion a internet"
+    return
   }
 
-  Write-Host "Instalacion completada con exito"
+  foreach ($name in $Packages) {
+    if (Test-IsPackageInstalled($name)) {
+      Write-Host "El programa $($name) ya esta instalado"
+    } else {
+      Write-Host "Instalando $($name)"
+      Invoke-PackageInstall($name)
+    }
+  }
+
+  Write-Host "`nInstalacion completada con exito"
 }
 
 $essentials =
@@ -186,13 +237,13 @@ $essentials =
 "Notepad++.Notepad++",
 "7zip.7zip",
 "Discord.Discord",
-"9NKSQGP7F2NH",
-"Spotify.Spotify",
+#"Spotify.Spotify", gives random problems
 "Zoom.Zoom",
 "Valve.Steam"
 
 $windowsDevelopment =
 "Git.Git",
+"Github.cli",
 "Oracle.JDK.17",
 "JetBrains.IntelliJIDEA.Community",
 "Microsoft.VisualStudioCode",
@@ -202,19 +253,19 @@ $windowsDevelopment =
 "Oracle.VirtualBox"
 
 $wslDevelopment =
-"Neovim.Neovim",
-"Github.cli",
 "Docker.DockerDesktop",
 "Microsoft.VisualStudioCode",
 "WinSCP.WinSCP"
 
-$Host.UI.RawUI.WindowTitle = "Legion 5 Pro Customization Tools v1.1"
+$beforeTitle = $Host.UI.RawUI.WindowTitle
+$Host.UI.RawUI.WindowTitle = "Legion 5 Pro Customization Tools v1.2"
+
 while (1) {
   Clear-Host
   Write-Host @"
   `t   __       ______   ______     ______   __  __   ______   _________  ______   ___ __ __   ______
   `t  /_/\     /_____/\ /_____/\   /_____/\ /_/\/_/\ /_____/\ /________/\/_____/\ /__//_//_/\ /_____/\
-  `t  \:\ \    \::::_\/_\:::_ \ \  \:::__\/ \:\ \:\ \\::::_\/_\__.::.__\/\:::_ \ \\::\ | \ | \ \\::::_\/_
+  `t  \:\ \    \::::_\/_\:::_ \ \  \:::__\/ \:\ \:\ \\::::_\/_\__.::.__\/\:::_ \ \\::\ | \ | \ \\::::_\
   `t   \:\ \    \:\/___/\\:(_) \ \  \:\ \  __\:\ \:\ \\:\/___/\  \::\ \   \:\ \ \ \\:.      \ \\:\/___/\
   `t    \:\ \____\_::._\:\\: ___\/   \:\ \/_/\\:\ \:\ \\_::._\:\  \::\ \   \:\ \ \ \\:.\-/\  \ \\_::._\:\
   `t     \:\/___/\/_____\/ \ \ \      \:\_\ \ \\:\_\:\ \ /____\:\  \::\ \   \:\_\ \ \\. \  \  \ \ /____\:\
@@ -223,18 +274,18 @@ while (1) {
   `t     ____  ____  _____   ________  ____  ____ _/ /_____     ____ ___  ____  ____  _________  __  __
   `t    / __ \/ __ \/ ___/  / ___/ _ \/ __ \/ __ `/ __/ __ \   / __ `__ \/ __ \/ __ \/ ___/ __ \/ / / /
   `t   / /_/ / /_/ / /     / /  /  __/ / / / /_/ / /_/ /_/ /  / / / / / / /_/ / / / / /  / /_/ / /_/ /
-  `t  / .___/\____/_/     /_/   \___/_/ /_/\__, _/\__/\____/  /_/ /_/ /_/\____/_/ /_/_/   \____/\__, /
+  `t  / .___/\____/_/     /_/   \___/_/ /_/\__, _/\__/\___/  /_/ /_/ /_/\____/_/ /_/_/   \____/\__, /
   `t /_/                                                                                      /____/
 "@
 
   Write-Host @"
-  `t`t`t`t1 - Restauracion del nombre del modelo
+  `t`t`t`t1 - Restauracion del nombre del modelo (ADMIN)
   `t`t`t`t2 - Instalacion manual de controladores
-  `t`t`t`t3 - Desactivar actualizaciones a los controladores
+  `t`t`t`t3 - Desactivar actualizaciones a los controladores (ADMIN)
   `t`t`t`t4 - Instalacion de herramientas de desarrollo para Windows
   `t`t`t`t5 - Instalacion de herramientas de desarrollo para WSL
   `t`t`t`t6 - Instalacion de programas comunes
-  `t`t`t`t7 - Desactivar Windows Defender
+  `t`t`t`t7 - Desactivar Windows Defender (ADMIN)
   `t`t`t`t8 - Activacion para MS Windows 10/11 & Office Pro Plus 2021
   `t`t`t`t9 - Salir
 "@
@@ -249,7 +300,7 @@ while (1) {
 
     "2" {
       Clear-Host
-      Write-Host "Not implemented"
+      Open-FSWindow("C:\Drivers")
       Wait-KeyPress
     }
 
@@ -279,16 +330,13 @@ while (1) {
 
     "7" {
       Clear-Host
-      if (!(Test-SafeMode)) {
-        Disable-WindowsDefender
-      } else {
-        Write-Host "You must run this on Safe Mode."
-      }
+      Disable-WindowsDefender
       Wait-KeyPress
     }
 
     "8" {
       Clear-Host
+      # TODO: Pull script from remote repo
       Write-Host "Not implemented"
       Wait-KeyPress
     }
